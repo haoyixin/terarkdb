@@ -11,6 +11,7 @@ LIB_SOURCES =                                                   \
   db/compaction.cc                                              \
   db/compaction_iterator.cc                                     \
   db/compaction_job.cc                                          \
+  db/compaction_state.cc                                        \
   db/compaction_picker.cc                                       \
   db/compaction_picker_fifo.cc                                  \
   db/compaction_picker_universal.cc                             \
@@ -281,6 +282,7 @@ MAIN_SOURCES =                                                          \
   db/compaction_iterator_test.cc                                        \
   db/compaction_job_stats_test.cc                                       \
   db/compaction_job_test.cc                                             \
+  db/compaction_range_registry_test.cc
   db/compaction_picker_test.cc                                          \
   db/comparator_db_test.cc                                              \
   db/corruption_test.cc                                                 \

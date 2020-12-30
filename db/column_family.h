@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "db/compaction_state.h"
 #include "db/memtable_list.h"
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
@@ -411,6 +412,30 @@ class ColumnFamilyData {
 
   Directory* GetDataDir(size_t path_id) const;
 
+  bool TryBufferCompactionState(
+      std::shared_ptr<CompactionState> compactionstate);
+
+  std::list<std::shared_ptr<CompactionState>>& compactionstate_buffer(
+      int level) {
+    return compactionstate_buffer_[level];
+  }
+
+  size_t compactionstate_buffer_size(int level) const {
+    return compactionstate_buffer_[level].size();
+  }
+
+  void LockLevel(int level) {
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::Install::LockLevel", &level);
+    assert(level < level_mutexs_.size());
+    level_mutexs_[level].lock();
+  }
+
+  void UnlockLevel(int level) {
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::Install::UnlockLevel", &level);
+    assert(level < level_mutexs_.size());
+    level_mutexs_[level].unlock();
+  }
+
  private:
   friend class ColumnFamilySet;
   ColumnFamilyData(uint32_t id, const std::string& name,
@@ -499,6 +524,13 @@ class ColumnFamilyData {
 
   // Directories corresponding to cf_paths.
   std::vector<std::unique_ptr<Directory>> data_dirs_;
+
+  // each level has a CompactionState Buffer
+  std::vector<std::list<std::shared_ptr<CompactionState>>>
+      compactionstate_buffer_;
+
+  // map of level must update sequentially
+  std::vector<std::mutex> level_mutexs_;
 };
 
 // ColumnFamilySet has interesting thread-safety requirements

@@ -253,6 +253,7 @@ class CompactionPicker {
                        const CompactionInputFiles& inputs,
                        const CompactionInputFiles& output_level_inputs,
                        std::vector<FileMetaData*>* grandparents);
+  Compaction* PickMapCompaction(int level, uint64_t pick_size, double q);
 
   // Pick compaction which level has map or link sst
   Compaction* PickCompositeCompaction(
@@ -289,6 +290,51 @@ class CompactionPicker {
     return &compactions_in_progress_;
   }
 
+  void set_columnfamilydata(const ColumnFamilyData* cfd) { cfd_ = cfd; }
+
+  // since only one range per compaction, do register one by one
+  bool RegisterRangeInLevels(CompactionParams& p) {
+    auto do_register = [this](SelectedRange& input_range,
+                              const std::set<int>& all_levels) {
+      std::stack<int> registered_levels;
+      for (auto& level : all_levels) {
+        if (!range_registries_[level]->RegisterRange(input_range)) {
+          // one level fail, rollback
+          while (!registered_levels.empty()) {
+            range_registries_[registered_levels.top()]->UnregisterRange(
+                input_range);
+            registered_levels.pop();
+          }
+          return false;
+        } else {
+          registered_levels.push(level);
+        }
+      }
+
+      return true;  // all level register success, keep it
+    };
+
+    p.success = do_register(p.input_range, p.all_levels());
+    TEST_SYNC_POINT_CALLBACK("CompactionPicker::RegisterRangesInLevels::After",
+                             &p);
+    return p.success;
+  }
+
+  // it may unregistered many ranges once, since compactionstate can be buffered
+  // and group installed by later compactionjob
+  void UnregisterRangesInLevels(Compaction* c) {
+    assert(c->compaction_type() == kMapCompaction ||
+           c->all_levels().size() == 1);
+    for (auto& r : c->install_range()) {
+      for (auto level : c->all_levels()) {
+        bool s = range_registries_[level]->UnregisterRange(r);
+        assert(s);
+      }
+    }
+    TEST_SYNC_POINT_CALLBACK(
+        "CompactionPicker::UnregisterRangesInLevels::After", c);
+  }
+
  protected:
   TableCache* table_cache_;
   const EnvOptions& env_options_;
@@ -311,6 +357,12 @@ class CompactionPicker {
   std::unordered_set<Compaction*> compactions_in_progress_;
 
   const InternalKeyComparator* const icmp_;
+
+  // each level need register Ranges into its registry to make sure that one
+  // range can only be processed in one compaction
+  std::vector<std::unique_ptr<RangeRegistry>> range_registries_;
+
+  const ColumnFamilyData* cfd_;
 };
 
 class LevelCompactionPicker : public CompactionPicker {

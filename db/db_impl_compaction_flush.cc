@@ -976,8 +976,7 @@ Status DBImpl::CompactFilesImpl(
       compact_options.max_subcompactions > 0
           ? compact_options.max_subcompactions
           : c->mutable_cf_options()->max_subcompactions;
-  int sub_compaction_scheduled =
-      compaction_job.Prepare(GetSubCompactionSlots(max_subcompactions));
+  int sub_compaction_scheduled = compaction_job.Prepare(0);
   bg_compaction_scheduled_ += sub_compaction_scheduled;
   mutex_.Unlock();
   TEST_SYNC_POINT("CompactFilesImpl:0");
@@ -2800,8 +2799,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         &event_logger_, c->mutable_cf_options()->paranoid_file_checks,
         c->mutable_cf_options()->report_bg_io_stats, dbname_,
         &compaction_job_stats);
-    int sub_compaction_scheduled =
-        compaction_job.Prepare(GetSubCompactionSlots(c->max_subcompactions()));
+    int sub_compaction_scheduled = compaction_job.Prepare(0);
     bg_compaction_scheduled_ += sub_compaction_scheduled;
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,

@@ -297,6 +297,9 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Default: 0 (init from DBOptions::max_subcompactions.)
   uint32_t max_subcompactions = 8;
 
+  // compaction can do fake-install, and trans its compactionstate to
+  // columnfamilydata's compactionstatebuffer
+  uint32_t compactionstate_buffer_size = 4;
   // Don't separate Value if value.size < blob_size
   // Set size_t(-1) to disable Key Value separation
   // valid [8 , size_t(-1)]

@@ -187,7 +187,6 @@ Compaction::Compaction(CompactionParams&& params)
       num_antiquation_(params.num_antiquation),
       max_output_file_size_(params.target_file_size),
       max_compaction_bytes_(params.max_compaction_bytes),
-      max_subcompactions_(params.max_subcompactions),
       immutable_cf_options_(params.immutable_cf_options),
       mutable_cf_options_(params.mutable_cf_options),
       input_version_(nullptr),
@@ -197,7 +196,7 @@ Compaction::Compaction(CompactionParams&& params)
       output_compression_(params.compression),
       output_compression_opts_(params.compression_opts),
       deletion_compaction_(params.deletion_compaction),
-      partial_compaction_(params.partial_compaction),
+      lazy_compaction_(params.lazy_compaction),
       compaction_type_(params.compaction_type),
       input_range_(std::move(params.input_range)),
       inputs_(std::move(params.inputs)),
@@ -210,14 +209,12 @@ Compaction::Compaction(CompactionParams&& params)
       is_manual_compaction_(params.manual_compaction),
       is_trivial_move_(false),
       compaction_reason_(params.compaction_reason) {
-  MarkFilesBeingCompacted(true);
+  if (!lazy_compaction_) {
+    MarkFilesBeingCompacted(true);
+  }
   if (is_manual_compaction_) {
     compaction_reason_ = CompactionReason::kManualCompaction;
   }
-  if (max_subcompactions_ == 0) {
-    max_subcompactions_ = mutable_cf_options_.max_subcompactions;
-  }
-
 #ifndef NDEBUG
   for (size_t i = 1; i < inputs_.size(); ++i) {
     assert(inputs_[i].level > inputs_[i - 1].level);
@@ -411,8 +408,38 @@ uint64_t Compaction::CalculateTotalInputSize() const {
 }
 
 void Compaction::ReleaseCompactionFiles(Status status) {
-  MarkFilesBeingCompacted(false);
+  TEST_SYNC_POINT("Compaction::ReleaseCompactionFiles");
+  if (!lazy_compaction_) {
+    MarkFilesBeingCompacted(false);
+  }
   cfd_->compaction_picker()->ReleaseCompactionFiles(this, status);
+  if (compaction_type_ != CompactionType::kGarbageCollection && status.ok()) {
+    TEST_SYNC_POINT_CALLBACK(
+        "Compaction::ReleaseCompactionFiles::UnrefCurrentVersion", this);
+    UnRefInstallVersion();
+  }
+}
+
+void Compaction::RefCurrentVersionAsInstallVersion() {
+  assert(install_version_ == nullptr);
+  cfd_->current()->Ref();
+  install_version_ = cfd_->current();
+}
+void Compaction::UnRefInstallVersion() {
+  if (nullptr != install_version_) install_version_->Unref();
+}
+
+std::vector<SelectedRange> Compaction::install_range() {
+  std::vector<SelectedRange> install_ranges;
+  if (is_fake_installed_) {
+    assert(compaction_state_ != nullptr);
+    for (auto& sub_compact_state : compaction_state_->sub_compact_states) {
+      install_ranges.push_back(sub_compact_state.compaction->input_range_);
+    }
+  } else {
+    return {input_range()};
+  }
+  return install_ranges;
 }
 
 void Compaction::ResetNextCompactionIndex() {
@@ -506,21 +533,6 @@ std::unique_ptr<CompactionFilter> Compaction::CreateCompactionFilter() const {
 
 bool Compaction::IsOutputLevelEmpty() const {
   return inputs_.back().level != output_level_ || inputs_.back().empty();
-}
-
-bool Compaction::ShouldFormSubcompactions() const {
-  if (compaction_type_ == kMapCompaction || max_subcompactions_ <= 1 ||
-      cfd_ == nullptr) {
-    return false;
-  }
-  if (cfd_->ioptions()->compaction_style == kCompactionStyleLevel) {
-    return (start_level_ == 0 || is_manual_compaction_) && output_level_ > 0 &&
-           !IsOutputLevelEmpty();
-  } else if (cfd_->ioptions()->compaction_style == kCompactionStyleUniversal) {
-    return number_levels_ > 1 && output_level_ > 0;
-  } else {
-    return false;
-  }
 }
 
 uint64_t Compaction::MaxInputFileCreationTime() const {

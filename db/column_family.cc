@@ -460,7 +460,9 @@ ColumnFamilyData::ColumnFamilyData(
       queued_for_garbage_collection_(false),
       prev_compaction_needed_bytes_(0),
       allow_2pc_(db_options.allow_2pc),
-      last_memtable_id_(0) {
+      last_memtable_id_(0),
+      compactionstate_buffer_(cf_options.num_levels),
+      level_mutexs_(cf_options.num_levels) {
   Ref();
 
   // Convert user defined table properties collector factories to internal ones.
@@ -497,6 +499,7 @@ ColumnFamilyData::ColumnFamilyData(
       compaction_picker_.reset(new LevelCompactionPicker(
           table_cache_.get(), env_options, ioptions_, &internal_comparator_));
     }
+    compaction_picker_->set_columnfamilydata(this);
 
     if (column_family_set_->NumberOfColumnFamilies() < 10) {
       ROCKS_LOG_INFO(ioptions_.info_log,
@@ -707,6 +710,26 @@ int GetL0ThresholdSpeedupCompaction(int level0_file_num_compaction_trigger,
   }
 }
 }  // namespace
+
+bool ColumnFamilyData::TryBufferCompactionState(
+    std::shared_ptr<CompactionState> compactionstate) {
+  // only buffer kKeyValueCompaction
+  assert(compactionstate->compaction->compaction_type() == kKeyValueCompaction);
+  assert(compactionstate->sub_compact_states.size() == 1);
+
+  if (compactionstate->sub_compact_states[0].is_level_last_compaction)
+    return false;
+
+  int level = compactionstate->compaction->output_level();
+
+  if (compactionstate_buffer_[level].size() <
+      mutable_cf_options_.compactionstate_buffer_size) {
+    compactionstate_buffer_[level].push_back(compactionstate);
+    compactionstate->compaction->set_fake_install();
+    return true;
+  }
+  return false;
+}
 
 std::pair<WriteStallCondition, ColumnFamilyData::WriteStallCause>
 ColumnFamilyData::GetWriteStallConditionAndCause(

@@ -149,6 +149,7 @@ struct MutableCFOptions {
         prefix_extractor(options.prefix_extractor),
         disable_auto_compactions(options.disable_auto_compactions),
         max_subcompactions(options.max_subcompactions),
+        compactionstate_buffer_size(options.compactionstate_buffer_size),
         blob_size(options.blob_size),
         blob_large_key_ratio(options.blob_large_key_ratio),
         blob_gc_ratio(options.blob_gc_ratio),
@@ -189,6 +190,7 @@ struct MutableCFOptions {
         prefix_extractor(nullptr),
         disable_auto_compactions(false),
         max_subcompactions(0),
+        compactionstate_buffer_size(0),
         blob_size(0),
         blob_large_key_ratio(0),
         blob_gc_ratio(0),
@@ -246,6 +248,7 @@ struct MutableCFOptions {
   // Compaction related options
   bool disable_auto_compactions;
   uint32_t max_subcompactions;
+  uint32_t compactionstate_buffer_size;
   size_t blob_size;
   double blob_large_key_ratio;
   double blob_gc_ratio;

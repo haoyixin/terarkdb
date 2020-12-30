@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "db/column_family.h"
+#include "db/compaction.h"
 #include "db/map_builder.h"
 #include "monitoring/statistics.h"
 #include "util/c_style_callback.h"
@@ -249,7 +250,12 @@ CompactionPicker::CompactionPicker(TableCache* table_cache,
     : table_cache_(table_cache),
       env_options_(env_options),
       ioptions_(ioptions),
-      icmp_(icmp) {}
+      icmp_(icmp),
+      range_registries_(ioptions_.num_levels) {
+  for (auto& rr : range_registries_) {
+    rr.reset(new RangeRegistry(ioptions_.user_comparator));
+  }
+}
 
 CompactionPicker::~CompactionPicker() {}
 
@@ -1332,10 +1338,14 @@ Compaction* CompactionPicker::PickRangeCompaction(
   params.compression_opts = GetCompressionOptions(ioptions_, vstorage, level);
   params.manual_compaction = true;
   params.score = 0;
-  params.partial_compaction = true;
+  params.lazy_compaction = true;
   params.max_subcompactions = max_subcompactions;
   params.compaction_type = kKeyValueCompaction;
-  params.input_range = std::move(input_range);
+#warning "wrong code, not support rangecompaction now"
+  // TODO
+  assert(input_range.size() == 1);
+  params.input_range = std::move(input_range[0]);
+  if (!RegisterRangeInLevels(params)) return nullptr;
 
   return RegisterCompaction(new Compaction(std::move(params)));
 }
@@ -1587,11 +1597,18 @@ void CompactionPicker::UnregisterCompaction(Compaction* c) {
   if (c == nullptr) {
     return;
   }
+  if (c->compaction_type() != CompactionType::kGarbageCollection &&
+      !c->is_fake_install()) {
+    UnregisterRangesInLevels(c);
+  }
+
   if (c->start_level() == 0 ||
       ioptions_.compaction_style == kCompactionStyleUniversal) {
     level0_compactions_in_progress_.erase(c);
   }
   compactions_in_progress_.erase(c);
+  TEST_SYNC_POINT_CALLBACK("CompactionPicker::UnregisterCompaction::After",
+                           c);
 }
 
 /*
@@ -1672,7 +1689,7 @@ Compaction* CompactionPicker::PickCompositeCompaction(
   CompactionType compaction_type = kKeyValueCompaction;
   std::vector<SelectedRange> input_range;
 
-  auto new_compaction = [&] {
+  auto new_compaction = [&]() -> Compaction* {
     int level = input.level;
     CompactionParams params(vstorage, ioptions_, mutable_cf_options);
     params.inputs = std::move(inputs);
@@ -1687,10 +1704,22 @@ Compaction* CompactionPicker::PickCompositeCompaction(
         GetCompressionOptions(ioptions_, vstorage, level, true);
     params.max_subcompactions = max_subcompactions;
     params.score = read_amp;
-    params.partial_compaction = true;
+    params.lazy_compaction = true;
     params.compaction_type = compaction_type;
-    params.input_range = std::move(input_range);
+    assert(compaction_type == kKeyValueCompaction && input_range.size() >= 1);
+    params.input_range = std::move(*(std::max_element(
+        input_range.begin(), input_range.end(), TERARK_CMP(weight, >))));
+    if (input_range.size() == 1) {
+      params.input_range.set_is_level_last_range(true);
+    }
     params.compaction_reason = CompactionReason::kCompositeAmplification;
+
+    if (params.compaction_type != CompactionType::kGarbageCollection) {
+      if (!RegisterRangeInLevels(params)) {
+        // No range is registerable
+        return nullptr;
+      }
+    }
 
     return new Compaction(std::move(params));
   };
@@ -1868,9 +1897,8 @@ Compaction* CompactionPicker::PickCompositeCompaction(
       sum += estimate_size(map_element);
       push_unique(iter->key());
     } while (sum < pick_size);
-    input_range.emplace_back(SelectedRange(std::move(range), weight));
-    if (input_range.size() >= max_subcompactions) {
-      break;
+    if (range_registries_[input.level]->TryRegisterRange(range)) {
+      input_range.emplace_back(std::move(range), weight);
     }
   }
   if (!input_range.empty()) {
@@ -2045,10 +2073,13 @@ Compaction* CompactionPicker::PickBottommostLevelCompaction(
       GetCompressionOptions(ioptions_, vstorage, level, true);
   params.max_subcompactions = max_subcompactions;
   params.score = 0;
-  params.partial_compaction = true;
+  params.lazy_compaction = true;
   params.compaction_type = kKeyValueCompaction;
-  params.input_range = std::move(input_range);
+  assert(input_range.size() == 1);
+  params.input_range = std::move(input_range[0]);
   params.compaction_reason = CompactionReason::kBottommostFiles;
+
+  if (!RegisterRangeInLevels(params)) return nullptr;
 
   return new Compaction(std::move(params));
 }
@@ -2166,6 +2197,10 @@ class LevelCompactionBuilder {
 
   // Pick lazy compaction
   Compaction* PickLazyCompaction(const std::vector<SequenceNumber>& snapshots);
+
+  // Pick compaction if turn on lazy and level has more than one file
+  Status PickMapCompaction(int level, uint64_t pick_size, double q,
+                           size_t base_size, size_t target_file_size_base);
 
   // Pick the initial files to compact to the next level. (or together
   // in Intra-L0 compactions)
@@ -2457,7 +2492,7 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
       compaction_inputs_[1].files = vstorage_->LevelFiles(1);
       start_level_ = 0;
       output_level_ = 1;
-      compaction_type_ = CompactionType::kMapCompaction;
+      compaction_type_ = kMapCompaction;
       compaction_reason_ = vstorage_->has_range_deletion(0)
                                ? CompactionReason::kRangeDeletion
                                : CompactionReason::kLevelL0FilesNum;
@@ -2496,227 +2531,7 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
 
   sorted_runs[bottommost_level].being_compacted =
       picker->AreFilesInCompaction(vstorage_->LevelFiles(bottommost_level));
-  auto pick_map_compaction = [&](int level, uint64_t pick_size, double q) {
-    auto& level_files = vstorage_->LevelFiles(level);
-    auto& next_level_files = vstorage_->LevelFiles(level + 1);
-    DependenceMap empty_dependence_map;
-    ReadOptions options;
-    auto create_iter = [&](const FileMetaData* file_metadata,
-                           const DependenceMap& depend_map, Arena* arena,
-                           TableReader** table_reader_ptr) {
-      return picker->table_cache()->NewIterator(
-          options, picker->env_options(), ioptions_.internal_comparator,
-          *file_metadata, depend_map, nullptr,
-          mutable_cf_options_.prefix_extractor.get(), table_reader_ptr, nullptr,
-          false, arena, true, -1);
-    };
-    std::vector<LevelMapRangeSrc> src;
-    Arena arena;
-    {
-      auto calc_estimate_info = [&](const MapSstElement& elem) {
-        auto& dependence_map = vstorage_->dependence_map();
-        double total_entry_num = 0;
-        double total_del_num = 0;
-        for (auto& link : elem.link) {
-          auto find = dependence_map.find(link.file_number);
-          if (find == dependence_map.end()) {
-            // TODO log error
-            continue;
-          }
-          auto meta = find->second;
-          double ratio = link.size / meta->fd.GetFileSize();
-          total_entry_num += meta->prop.num_entries * ratio;
-          total_del_num += meta->prop.num_deletions * ratio;
-        }
-        return std::make_pair(total_entry_num, total_del_num);
-      };
-      ScopedArenaIterator iter(
-          NewMapElementIterator(level_files.data(), level_files.size(),
-                                &ioptions_.internal_comparator, &create_iter,
-                                c_style_callback(create_iter), &arena));
-      if (!iter->status().ok()) {
-        return iter->status();
-      }
-      MapSstElement map_element;
-      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-        if (!CompactionPicker::ReadMapElement(map_element, iter.get(),
-                                              log_buffer_, cf_name_)) {
-          return Status::Corruption("CompactionPicker bad map element");
-        }
-        double estimate_entry_num;
-        double estimate_del_num;
-        std::tie(estimate_entry_num, estimate_del_num) =
-            calc_estimate_info(map_element);
-        src.emplace_back(map_element, estimate_entry_num, estimate_del_num,
-                         &arena);
-      }
-    }
-    if (src.empty()) {
-      return Status::OK();
-    }
-    std::vector<LevelMapRangeDst> dst;
-    {
-      ScopedArenaIterator iter(NewMapElementIterator(
-          next_level_files.data(), next_level_files.size(),
-          &ioptions_.internal_comparator, &create_iter,
-          c_style_callback(create_iter), &arena));
-      if (!iter->status().ok()) {
-        return iter->status();
-      }
-      MapSstElement map_element;
-      uint64_t accumulate = 0;
-      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
-        if (!CompactionPicker::ReadMapElement(map_element, iter.get(),
-                                              log_buffer_, cf_name_)) {
-          return Status::Corruption("CompactionPicker bad map element");
-        }
-        dst.emplace_back(map_element, &arena);
-        accumulate += dst.back().estimate_size;
-        dst.back().accumulate_estimate_size = accumulate;
-      }
-    }
-    if (dst.empty()) {
-      uint64_t src_size = 0;
-      for (auto it = src.begin(); it != src.end(); ++it) {
-        src_size += it->estimate_size;
-        if (src_size >= pick_size) {
-          if (++it != src.end()) {
-            input_range_.emplace_back(ExtractUserKey(src.front().start),
-                                      ExtractUserKey(it->start), true, false);
-          } else {
-            input_range_.emplace_back(ExtractUserKey(src.front().start),
-                                      ExtractUserKey(src.back().limit), true,
-                                      true);
-          }
-          break;
-        }
-      }
-    } else {
-      std::vector<LevelMapSection> sections;
-      auto m = dst.size();
-      auto& kMin = dst.front().start;
-      auto& kMax = dst.back().limit;
-      auto ic = &ioptions_.internal_comparator;
-      for (size_t i = 0, p = 0; i < src.size(); ++i) {
-        if (ic->Compare(src[i].limit, kMin) < 0) {
-          src[i].start_index = src[i].limit_index = 0;
-          continue;
-        }
-        if (ic->Compare(kMax, src[i].start) < 0) {
-          src[i].start_index = src[i].limit_index = m - 1;
-          continue;
-        }
-        while (ic->Compare(dst[p].limit, src[i].start) < 0) {
-          p++;
-        }
-        src[i].start_index = p < m ? p : m - 1;
-        while (p < m && ic->Compare(dst[p].limit, src[i].limit) < 0) {
-          p++;
-        }
-        src[i].limit_index = p < m ? p : m - 1;
-      }
-      auto queue_start = src.begin();
-      auto queue_limit = queue_start;
-      size_t src_size = queue_start->estimate_size;
-      double entry_num = queue_start->estimate_entry_num;
-      double del_num = queue_start->estimate_del_num;
 
-      auto fn_new_section = [&] {
-        auto overlap_ratio =
-            double(src_size) /
-            double(src_size +
-                   dst[queue_limit->limit_index].accumulate_estimate_size -
-                   dst[queue_start->start_index].accumulate_estimate_size +
-                   dst[queue_start->start_index].estimate_size + 1);
-        auto deletion_ratio = del_num / entry_num;
-        sections.emplace_back(LevelMapSection{
-            queue_start - src.begin(), queue_limit - src.begin(),
-            MixOverlapRatioAndDeletionRatio(overlap_ratio, deletion_ratio)});
-      };
-
-      auto fn_step_right = [&] {
-        ++queue_limit;
-        src_size += queue_limit->estimate_size;
-        entry_num += queue_limit->estimate_entry_num;
-        del_num += queue_limit->estimate_del_num;
-        if (src_size > base_size) {
-          fn_new_section();
-        }
-      };
-
-      auto fn_step_left = [&] {
-        src_size -= queue_start->estimate_size;
-        entry_num -= queue_start->estimate_entry_num;
-        del_num -= queue_start->estimate_del_num;
-        ++queue_start;
-        if (src_size > target_file_size_base) {
-          fn_new_section();
-        }
-      };
-
-      assert(!src.empty());
-      auto queue_end = src.end() - 1;
-      do {
-        while (src_size < pick_size && queue_limit != queue_end) {
-          fn_step_right();
-        }
-        while (src_size >= target_file_size_base) {
-          fn_step_left();
-        }
-      } while (queue_limit != queue_end);
-
-      if (sections.empty()) {
-        queue_start = src.begin();
-        queue_limit = src.end() - 1;
-        src_size = 0;
-        entry_num = 0;
-        del_num = 0;
-        for (auto& item : src) {
-          src_size += item.estimate_size;
-          entry_num += item.estimate_entry_num;
-          del_num += item.estimate_del_num;
-        }
-        fn_new_section();
-      } else {
-        std::sort(sections.begin(), sections.end(), TERARK_CMP(weight, >));
-      }
-      src_size = 0;
-      for (size_t i = 0; i < sections.size(); ++i) {
-        for (ptrdiff_t j = sections[i].start_index;
-             j <= sections[i].limit_index; ++j) {
-          src_size += src[j].estimate_size;
-          src[j].estimate_size = 0;
-        }
-        if (sections[i].limit_index + 1 < ptrdiff_t(src.size())) {
-          input_range_.emplace_back(
-              ExtractUserKey(src[sections[i].start_index].start),
-              ExtractUserKey(src[sections[i].limit_index + 1].start), true,
-              false);
-        } else {
-          input_range_.emplace_back(
-              ExtractUserKey(src[sections[i].start_index].start),
-              ExtractUserKey(src[sections[i].limit_index].limit), true, true);
-        }
-        if (src_size >= pick_size) {
-          break;
-        }
-      }
-    }
-    if (CompactionPicker::FixInputRange(input_range_,
-                                        ioptions_.internal_comparator,
-                                        true /* sort */, true /* merge */)) {
-      compaction_inputs_.resize(2);
-      compaction_inputs_[0].level = level;
-      compaction_inputs_[0].files = level_files;
-      compaction_inputs_[1].level = level + 1;
-      compaction_inputs_[1].files = next_level_files;
-      output_level_ = level + 1;
-      start_level_score_ = q;
-      compaction_type_ = kMapCompaction;
-      compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
-    }
-    return Status::OK();
-  };
   auto pick_range_deletion = [&](int level) {
     auto& level_files = vstorage_->LevelFiles(level);
     Arena arena;
@@ -2814,7 +2629,8 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
       if (diff_size > double(pick_size)) {
         pick_size = uint64_t(diff_size);
       }
-      auto s = pick_map_compaction(i, pick_size, q_pair.first);
+      auto s = PickMapCompaction(i, pick_size, q_pair.first, base_size,
+                                 target_file_size_base);
       if (!s.ok()) {
         ROCKS_LOG_BUFFER(log_buffer_, "[%s] PickCompaction map error %s.",
                          cf_name_.c_str(), s.getState());
@@ -2838,7 +2654,8 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
         sorted_runs[i + 1].skip_composite = true;
         continue;
       }
-      auto s = pick_map_compaction(i, target_file_size_base, q_pair.second);
+      auto s = PickMapCompaction(i, target_file_size_base, q_pair.second,
+                                 base_size, target_file_size_base);
       if (!s.ok()) {
         ROCKS_LOG_BUFFER(log_buffer_, "[%s] PickCompaction map error %s.",
                          cf_name_.c_str(), s.getState());
@@ -2854,6 +2671,229 @@ Compaction* LevelCompactionBuilder::PickLazyCompaction(
                                          vstorage_, snapshots, sorted_runs,
                                          log_buffer_);
 }
+
+Status LevelCompactionBuilder::PickMapCompaction(int level, uint64_t pick_size,
+                                                 double q, size_t base_size,
+                                                 size_t target_file_size_base) {
+  auto& level_files = vstorage_->LevelFiles(level);
+  auto& next_level_files = vstorage_->LevelFiles(level + 1);
+  DependenceMap empty_dependence_map;
+  ReadOptions options;
+  auto create_iter = [&](const FileMetaData* file_metadata,
+                         const DependenceMap& depend_map, Arena* arena,
+                         TableReader** table_reader_ptr) {
+    return compaction_picker_->table_cache()->NewIterator(
+        options, compaction_picker_->env_options(),
+        ioptions_.internal_comparator, *file_metadata, depend_map, nullptr,
+        mutable_cf_options_.prefix_extractor.get(), table_reader_ptr, nullptr,
+        false, arena, true, -1);
+  };
+  std::vector<LevelMapRangeSrc> src;
+  Arena arena;
+  {
+    auto calc_estimate_info = [&](const MapSstElement& elem) {
+      auto& dependence_map = vstorage_->dependence_map();
+      double total_entry_num = 0;
+      double total_del_num = 0;
+      for (auto& link : elem.link) {
+        auto find = dependence_map.find(link.file_number);
+        if (find == dependence_map.end()) {
+          // TODO log error
+          continue;
+        }
+        auto meta = find->second;
+        double ratio = link.size / meta->fd.GetFileSize();
+        total_entry_num += meta->prop.num_entries * ratio;
+        total_del_num += meta->prop.num_deletions * ratio;
+      }
+      return std::make_pair(total_entry_num, total_del_num);
+    };
+    ScopedArenaIterator iter(NewMapElementIterator(
+        level_files.data(), level_files.size(), &ioptions_.internal_comparator,
+        &create_iter, c_style_callback(create_iter), &arena));
+    if (!iter->status().ok()) {
+      return iter->status();
+    }
+    MapSstElement map_element;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      if (!CompactionPicker::ReadMapElement(map_element, iter.get(),
+                                            log_buffer_, cf_name_)) {
+        return Status::Corruption("CompactionPicker bad map element");
+      }
+      double estimate_entry_num;
+      double estimate_del_num;
+      std::tie(estimate_entry_num, estimate_del_num) =
+          calc_estimate_info(map_element);
+      src.emplace_back(map_element, estimate_entry_num, estimate_del_num,
+                       &arena);
+    }
+  }
+  if (src.empty()) {
+    return Status::OK();
+  }
+  std::vector<LevelMapRangeDst> dst;
+  {
+    ScopedArenaIterator iter(
+        NewMapElementIterator(next_level_files.data(), next_level_files.size(),
+                              &ioptions_.internal_comparator, &create_iter,
+                              c_style_callback(create_iter), &arena));
+    if (!iter->status().ok()) {
+      return iter->status();
+    }
+    MapSstElement map_element;
+    uint64_t accumulate = 0;
+    for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+      if (!CompactionPicker::ReadMapElement(map_element, iter.get(),
+                                            log_buffer_, cf_name_)) {
+        return Status::Corruption("CompactionPicker bad map element");
+      }
+      dst.emplace_back(map_element, &arena);
+      accumulate += dst.back().estimate_size;
+      dst.back().accumulate_estimate_size = accumulate;
+    }
+  }
+  if (dst.empty()) {
+    uint64_t src_size = 0;
+    for (auto it = src.begin(); it != src.end(); ++it) {
+      src_size += it->estimate_size;
+      if (src_size >= pick_size) {
+        if (++it != src.end()) {
+          input_range_.emplace_back(ExtractUserKey(src.front().start),
+                                    ExtractUserKey(it->start), true, false);
+        } else {
+          input_range_.emplace_back(ExtractUserKey(src.front().start),
+                                    ExtractUserKey(src.back().limit), true,
+                                    true);
+        }
+        break;
+      }
+    }
+  } else {
+    std::vector<LevelMapSection> sections;
+    auto m = dst.size();
+    auto& kMin = dst.front().start;
+    auto& kMax = dst.back().limit;
+    auto ic = &ioptions_.internal_comparator;
+    for (size_t i = 0, p = 0; i < src.size(); ++i) {
+      if (ic->Compare(src[i].limit, kMin) < 0) {
+        src[i].start_index = src[i].limit_index = 0;
+        continue;
+      }
+      if (ic->Compare(kMax, src[i].start) < 0) {
+        src[i].start_index = src[i].limit_index = m - 1;
+        continue;
+      }
+      while (ic->Compare(dst[p].limit, src[i].start) < 0) {
+        p++;
+      }
+      src[i].start_index = p < m ? p : m - 1;
+      while (p < m && ic->Compare(dst[p].limit, src[i].limit) < 0) {
+        p++;
+      }
+      src[i].limit_index = p < m ? p : m - 1;
+    }
+    auto queue_start = src.begin();
+    auto queue_limit = queue_start;
+    size_t src_size = queue_start->estimate_size;
+    double entry_num = queue_start->estimate_entry_num;
+    double del_num = queue_start->estimate_del_num;
+
+    auto fn_new_section = [&] {
+      auto overlap_ratio =
+          double(src_size) /
+          double(src_size +
+                 dst[queue_limit->limit_index].accumulate_estimate_size -
+                 dst[queue_start->start_index].accumulate_estimate_size +
+                 dst[queue_start->start_index].estimate_size + 1);
+      auto deletion_ratio = del_num / entry_num;
+      sections.emplace_back(LevelMapSection{
+          queue_start - src.begin(), queue_limit - src.begin(),
+          MixOverlapRatioAndDeletionRatio(overlap_ratio, deletion_ratio)});
+    };
+
+    auto fn_step_right = [&] {
+      ++queue_limit;
+      src_size += queue_limit->estimate_size;
+      entry_num += queue_limit->estimate_entry_num;
+      del_num += queue_limit->estimate_del_num;
+      if (src_size > base_size) {
+        fn_new_section();
+      }
+    };
+
+    auto fn_step_left = [&] {
+      src_size -= queue_start->estimate_size;
+      entry_num -= queue_start->estimate_entry_num;
+      del_num -= queue_start->estimate_del_num;
+      ++queue_start;
+      if (src_size > target_file_size_base) {
+        fn_new_section();
+      }
+    };
+
+    assert(!src.empty());
+    auto queue_end = src.end() - 1;
+    do {
+      while (src_size < pick_size && queue_limit != queue_end) {
+        fn_step_right();
+      }
+      while (src_size >= target_file_size_base) {
+        fn_step_left();
+      }
+    } while (queue_limit != queue_end);
+
+    if (sections.empty()) {
+      queue_start = src.begin();
+      queue_limit = src.end() - 1;
+      src_size = 0;
+      entry_num = 0;
+      del_num = 0;
+      for (auto& item : src) {
+        src_size += item.estimate_size;
+        entry_num += item.estimate_entry_num;
+        del_num += item.estimate_del_num;
+      }
+      fn_new_section();
+    } else {
+      std::sort(sections.begin(), sections.end(), TERARK_CMP(weight, >));
+    }
+    src_size = 0;
+    for (size_t i = 0; i < sections.size(); ++i) {
+      for (ptrdiff_t j = sections[i].start_index; j <= sections[i].limit_index;
+           ++j) {
+        src_size += src[j].estimate_size;
+        src[j].estimate_size = 0;
+      }
+      if (sections[i].limit_index + 1 < ptrdiff_t(src.size())) {
+        input_range_.emplace_back(
+            ExtractUserKey(src[sections[i].start_index].start),
+            ExtractUserKey(src[sections[i].limit_index + 1].start), true,
+            false);
+      } else {
+        input_range_.emplace_back(
+            ExtractUserKey(src[sections[i].start_index].start),
+            ExtractUserKey(src[sections[i].limit_index].limit), true, true);
+      }
+      if (src_size >= pick_size) {
+        break;
+      }
+    }
+  }
+  if (CompactionPicker::FixInputRange(input_range_,
+                                      ioptions_.internal_comparator,
+                                      true /* sort */, true /* merge */)) {
+    compaction_inputs_.resize(2);
+    compaction_inputs_[0].level = level;
+    compaction_inputs_[0].files = level_files;
+    compaction_inputs_[1].level = level + 1;
+    compaction_inputs_[1].files = next_level_files;
+    output_level_ = level + 1;
+    start_level_score_ = q;
+    compaction_type_ = kMapCompaction;
+    compaction_reason_ = CompactionReason::kLevelMaxLevelSize;
+  }
+  return Status::OK();
+};
 
 Compaction* LevelCompactionBuilder::GetCompaction() {
   CompactionParams params(vstorage_, ioptions_, mutable_cf_options_);
@@ -2874,8 +2914,24 @@ Compaction* LevelCompactionBuilder::GetCompaction() {
   params.manual_compaction = is_manual_;
   params.score = start_level_score_;
   params.compaction_type = compaction_type_;
-  params.input_range = std::move(input_range_);
+  // RangeBasedCompaction only has one range per Compaction
+  // TODO pick only one range instead of do deletion here
+  assert(compaction_type_ == kMapCompaction && input_range_.size() <= 1);
+  if (input_range_.empty()) {
+    assert(compaction_type_ = kMapCompaction);
+    params.input_range = infinite_range;
+  } else {
+    params.input_range = std::move(input_range_[0]);
+  }
+
   params.compaction_reason = compaction_reason_;
+
+  if (compaction_type_ != CompactionType::kGarbageCollection) {
+    if (!compaction_picker_->RegisterRangeInLevels(params)) {
+      // No range is registerable
+      return nullptr;
+    }
+  }
 
   auto c = new Compaction(std::move(params));
 

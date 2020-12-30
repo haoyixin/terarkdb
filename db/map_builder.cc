@@ -1024,7 +1024,7 @@ Status MapBuilder::Build(const std::vector<CompactionInputFiles>& inputs,
     }
   }
 
-  // merge ranges
+  // merge ranges, level_ranges.size depend on min_merge_width
   // TODO(zouzhizhang): multi way union
   while (level_ranges.size() > 1) {
     auto union_a = level_ranges.begin();

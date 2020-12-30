@@ -108,7 +108,6 @@ class CompactionJob {
   static void CallProcessCompaction(void* arg);
 
  private:
-  struct SubcompactionState;
 
   void AggregateStatistics();
   void GenSubcompactionBoundaries(int max_usable_threads);
@@ -150,8 +149,7 @@ class CompactionJob {
   int job_id_;
 
   // CompactionJob state
-  struct CompactionState;
-  CompactionState* compact_;
+  std::shared_ptr<CompactionState> compact_;
   CompactionJobStats* compaction_job_stats_;
   InternalStats::CompactionStats compaction_stats_;
 
